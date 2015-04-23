@@ -2,3 +2,8 @@ markdown: redcarpet
 
 redcarpet:
   extensions: ['fenced_code_blocks', 'smart']
+
+exclude:
+  - 'Gemfile'
+  - 'Gemfile.lock'
+  - 'build-and-publish.sh'
