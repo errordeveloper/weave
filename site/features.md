@@ -63,8 +63,8 @@ To accomplish that, we assign each application a different subnet. So,
 in the above example, if we wanted to add another application similar
 to, but isolated from, our first, we'd launch the containers with...
 
-    host1# D=$(weave run 10.2.2.1/24 -t -i ubuntu)
-    host2# D=$(weave run 10.2.2.2/24 -t -i ubuntu)
+    host1# D=$(weave run 10.2.2.1/24 -t -i -d ubuntu)
+    host2# D=$(weave run 10.2.2.2/24 -t -i -d ubuntu)
 
 A quick 'ping' test in the containers confirms that they can talk to
 each other but not the containers of our first application...
@@ -114,7 +114,7 @@ situations, weave allows an existing, running container to be attached
 to the weave network. To illustrate, we can achieve the same effect as
 the first example with
 
-    host1# C=$(docker run -d -t -i ubuntu)
+    host1# C=$(docker run -t -i -d ubuntu)
     host1# weave attach 10.2.1.1/24 $C
 
 There is a matching `weave detach` command:

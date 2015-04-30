@@ -17,10 +17,11 @@ usage() {
     echo "weave setup"
     echo "weave launch     [-password <password>] [-nickname <nickname>] <peer> ..."
     echo "weave launch-dns <cidr>"
+    echo "weave launch-proxy"
     echo "weave connect    <peer>"
     echo "weave forget     <peer>"
     echo "weave run        [--with-dns] <cidr> [<cidr> ...] <docker run args> ..."
-    echo "weave start      <cidr> [<cidr> ...] <container_id>"
+    echo "weave start      <container_id>"
     echo "weave attach     <cidr> [<cidr> ...] <container_id>"
     echo "weave detach     <cidr> [<cidr> ...] <container_id>"
     echo "weave expose     <cidr>"
@@ -39,10 +40,11 @@ usage() {
 
 [ $# -gt 0 ] || usage
 
-# These are potentially used for remote execs, and have defaults, so
-# we introduce them here
+# These are potentially used for the proxy and for remote execs, and
+# have defaults, so we introduce them here
 DOCKER_BRIDGE=${DOCKER_BRIDGE:-docker0}
 PROCFS=${PROCFS:-/proc}
+PROXY_PORT=12375
 
 BASE_IMAGE=$DOCKERHUB_USER/weave
 BASE_DNS_IMAGE=$DOCKERHUB_USER/weavedns
@@ -51,48 +53,35 @@ IMAGE=$BASE_IMAGE:$IMAGE_VERSION
 DNS_IMAGE=$BASE_DNS_IMAGE:$IMAGE_VERSION
 EXEC_IMAGE=$BASE_EXEC_IMAGE:$IMAGE_VERSION
 
-exec_remote() {
-    docker run --rm \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        -v "$PROCFS":/hostproc \
-        -e VERSION \
-        -e WEAVE_DOCKER_ARGS \
-        -e WEAVEDNS_DOCKER_ARGS \
-        -e WEAVE_PASSWORD \
-        -e WEAVE_CONTAINER_NAME \
-        -e DOCKER_BRIDGE \
-        -e PROCFS=/hostproc --privileged --net=host \
-        $EXEC_IMAGE --local "$@"
+PROXY_CONTAINER_NAME=weaveproxy
+
+is_cidr() {
+    # The regexp here is far from precise, but good enough.
+    echo "$1" | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$' >/dev/null
 }
 
-# "run" is a special case because we want to use docker directly,
-# rather than the docker in $EXEC_IMAGE remotely. That's because we
-# are passing arbitrary arguments on to docker run, and we can't rely
-# on our baked-in docker to support those arguments.
-if [ "$1" = "--local" ]; then
-    LOCAL="$1"
-    shift 1
-    [ $(id -u) = 0 ] || {
-        echo "weave must be run as 'root' when run locally" >&2
+validate_cidr() {
+    if ! is_cidr "$1" ; then
+        echo "Invalid CIDR: $1" >&2
+        echo "CIDR must of be of form <ip_address>/<routing_prefix_length>, e.g. 10.2.1.1/24" >&2
         exit 1
-    }
-elif [ "$1" != "run" ]; then
-    exec_remote "$@"
-    exit $?
-fi
+    fi
+}
 
-CONTAINER_NAME=${WEAVE_CONTAINER_NAME:-weave}
-DNS_CONTAINER_NAME=weavedns
-BRIDGE=weave
-CONTAINER_IFNAME=ethwe
-MTU=65535
-PORT=6783
-HTTP_PORT=6784
-DNS_HTTP_PORT=6785
+collect_cidr_args() {
+    CIDR_ARGS=""
+    CIDR_COUNT=0
+    while is_cidr "$1"; do
+        CIDR_ARGS="$CIDR_ARGS $1"
+        CIDR_COUNT=$(($CIDR_COUNT + 1))
+        shift 1
+    done
+}
 
-COMMAND=$1
-
-shift 1
+docker_bridge_ip() {
+    DOCKER_BRIDGE_IP=$(ip -4 addr show dev $DOCKER_BRIDGE | grep -m1 -o 'inet [.0-9]*')
+    DOCKER_BRIDGE_IP=${DOCKER_BRIDGE_IP#inet }
+}
 
 dns_args() {
     if [ "$1" = "--with-dns" ] ; then
@@ -119,33 +108,100 @@ dns_args() {
     DNS_ARGS="$DNS_ARG $DNS_SEARCH_ARG"
 }
 
+proxy_host() {
+    case $DOCKER_HOST in
+        tcp://*)
+            PROXY_HOST=$(echo $DOCKER_HOST | sed -e 's|\(tcp://[0-9.]*\):[0-9]*|\1:'$PROXY_PORT'|')
+            ;;
+        *)
+            PROXY_HOST="tcp://localhost:$PROXY_PORT"
+            ;;
+    esac
+}
+
+ensure_proxy_running() {
+    case $(docker inspect --format '{{.State.Running}} {{.Config.Image}}' $PROXY_CONTAINER_NAME 2>/dev/null) in
+        "true $EXEC_IMAGE")
+            return 0
+            ;;
+        true*)
+            echo "Proxy already running with unknown image" >&2
+            exit 1
+            ;;
+        false*)
+            docker rm -f $PROXY_CONTAINER_NAME >/dev/null
+            ;;
+    esac
+    docker run --privileged --net=host -d \
+        --name=$PROXY_CONTAINER_NAME \
+        -p $PROXY_PORT:12375/tcp -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /proc:/hostproc -e PROCFS=/hostproc \
+        --entrypoint=/home/weave/proxy $EXEC_IMAGE "$@"
+}
+
+exec_remote() {
+    docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /proc:/hostproc -e PROCFS=/hostproc \
+        -e VERSION \
+        -e WEAVE_DOCKER_ARGS \
+        -e WEAVEDNS_DOCKER_ARGS \
+        -e WEAVE_PASSWORD \
+        -e WEAVE_CONTAINER_NAME \
+        -e DOCKER_BRIDGE \
+        --privileged --net=host \
+        $EXEC_IMAGE --local "$@"
+}
+
+if [ "$1" = "--local" ]; then
+    LOCAL="$1"
+    shift 1
+    [ $(id -u) = 0 ] || {
+        echo "weave must be run as 'root' when run locally" >&2
+        exit 1
+    }
+fi
+
+# "run" is a special case because we use the proxy to act for us
+if [ "$1" = "run" ]; then
+    shift 1
+    ensure_proxy_running >/dev/null
+
+    if [ "$LOCAL" = "--local" ]; then
+        dns_args "$@"
+    else
+        DNS_ARGS=$(exec_remote dns-args "$@")
+    fi
+    [ "$1" = "--with-dns" ] && shift 1
+
+    collect_cidr_args "$@"
+    shift $CIDR_COUNT
+
+    proxy_host
+    docker -H "$PROXY_HOST" run $DNS_ARGS -e "WEAVE_CIDR=$CIDR_ARGS" $@
+    exit $?
+elif [ -z "$LOCAL" ]; then
+    exec_remote "$@"
+    exit $?
+fi
+
+CONTAINER_NAME=${WEAVE_CONTAINER_NAME:-weave}
+DNS_CONTAINER_NAME=weavedns
+BRIDGE=weave
+CONTAINER_IFNAME=ethwe
+MTU=65535
+PORT=6783
+HTTP_PORT=6784
+DNS_HTTP_PORT=6785
+
+COMMAND=$1
+
+shift 1
+
 # utility function to check whether a command can be executed by the shell
 # see http://stackoverflow.com/questions/592620/how-to-check-if-a-program-exists-from-a-bash-script
 command_exists () {
     command -v $1 >/dev/null 2>&1
-}
-
-is_cidr() {
-    # The regexp here is far from precise, but good enough.
-    echo "$1" | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$' >/dev/null
-}
-
-validate_cidr() {
-    if ! is_cidr "$1" ; then
-        echo "Invalid CIDR: $1" >&2
-        echo "CIDR must of be of form <ip_address>/<routing_prefix_length>, e.g. 10.2.1.1/24" >&2
-        exit 1
-    fi
-}
-
-collect_cidr_args() {
-    CIDR_ARGS=""
-    CIDR_COUNT=0
-    while is_cidr "$1"; do
-        CIDR_ARGS="$CIDR_ARGS $1"
-        CIDR_COUNT=$(($CIDR_COUNT + 1))
-        shift 1
-    done
 }
 
 run_iptables() {
@@ -241,11 +297,6 @@ destroy_bridge() {
     run_iptables -t nat -F WEAVE >/dev/null 2>&1 || true
     run_iptables -t nat -D POSTROUTING -j WEAVE >/dev/null 2>&1 || true
     run_iptables -t nat -X WEAVE >/dev/null 2>&1 || true
-}
-
-docker_bridge_ip() {
-    DOCKER_BRIDGE_IP=$(ip -4 addr show dev $DOCKER_BRIDGE | grep -m1 -o 'inet [.0-9]*')
-    DOCKER_BRIDGE_IP=${DOCKER_BRIDGE_IP#inet }
 }
 
 # the following borrows from https://github.com/jpetazzo/pipework
@@ -662,6 +713,9 @@ case "$COMMAND" in
         populate_dns
         echo $DNS_CONTAINER
         ;;
+    launch-proxy)
+        ensure_proxy_running "$@"
+        ;;
     connect)
         [ $# -eq 1 ] || usage
         http_call $CONTAINER_NAME $HTTP_PORT POST /connect -d "peer=$1"
@@ -701,40 +755,14 @@ case "$COMMAND" in
             fi
         fi
         ;;
-    run)
-        [ $# -gt 0 ] || usage
-        if [ -n "$LOCAL" ]; then
-            dns_args "$@"
-        else
-            DNS_ARGS=$(exec_remote dns-args "$@")
-            [ "$1" = "--with-dns" ] && shift 1
-        fi
-        collect_cidr_args "$@"
-        shift $CIDR_COUNT
-        CONTAINER=$(docker run $DNS_ARGS -d "$@")
-        if [ -n "$LOCAL" ]; then
-            create_bridge
-            with_container_netns $CONTAINER attach $CIDR_ARGS >/dev/null
-            tell_dns PUT $CONTAINER $CIDR_ARGS
-        else
-            exec_remote attach $CIDR_ARGS $CONTAINER
-        fi
-        echo $CONTAINER
-        ;;
     dns-args)
         dns_args "$@"
         echo -n $DNS_ARGS
         ;;
     start)
-        [ $# -gt 1 ] || usage
-        collect_cidr_args "$@"
-        shift $CIDR_COUNT
-        CONTAINER_ID="$1"
-        create_bridge
-        CONTAINER=$(docker start $CONTAINER_ID)
-        with_container_netns $CONTAINER_ID attach $CIDR_ARGS >/dev/null
-        tell_dns PUT $CONTAINER_ID $CIDR_ARGS
-        echo $CONTAINER
+        ensure_proxy_running >/dev/null
+        proxy_host
+        docker -H $PROXY_HOST start "$@"
         ;;
     attach)
         [ $# -gt 1 ] || usage
@@ -797,11 +825,13 @@ case "$COMMAND" in
         ;;
     reset)
         [ $# -eq 0 ] || usage
-        docker stop  $CONTAINER_NAME     >/dev/null 2>&1 || true
-        docker stop  $DNS_CONTAINER_NAME >/dev/null 2>&1 || true
-        docker rm -f $CONTAINER_NAME     >/dev/null 2>&1 || true
-        docker rm -f $DNS_CONTAINER_NAME >/dev/null 2>&1 || true
-        conntrack -D -p udp --dport $PORT >/dev/null 2>&1 || true
+        docker stop  $CONTAINER_NAME       >/dev/null 2>&1 || true
+        docker stop  $DNS_CONTAINER_NAME   >/dev/null 2>&1 || true
+        docker stop  $PROXY_CONTAINER_NAME >/dev/null 2>&1 || true
+        docker rm -f $CONTAINER_NAME       >/dev/null 2>&1 || true
+        docker rm -f $DNS_CONTAINER_NAME   >/dev/null 2>&1 || true
+        docker rm -f $PROXY_CONTAINER_NAME >/dev/null 2>&1 || true
+        conntrack -D -p udp --dport $PORT  >/dev/null 2>&1 || true
         destroy_bridge
         for LOCAL_IFNAME in $(ip link show | grep v${CONTAINER_IFNAME}pl | cut -d ' ' -f 2 | tr -d ':') ; do
             ip link del $LOCAL_IFNAME

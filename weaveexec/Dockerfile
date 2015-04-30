@@ -6,4 +6,5 @@ RUN ["sh", "-c", "rm -rf /var/cache/apk/*"]
 ADD ./weave /home/weave/
 ADD ./sigproxy /home/weave/
 ADD ./docker.tgz /
+ADD ./proxy /home/weave/
 ENTRYPOINT ["/home/weave/sigproxy", "/home/weave/weave"]
