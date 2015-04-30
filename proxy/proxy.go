@@ -3,7 +3,7 @@ package proxy
 import (
 	"bytes"
 	"errors"
-	. "github.com/zettio/weave/common"
+	. "github.com/weaveworks/weave/common"
 	"io"
 	"io/ioutil"
 	"net"

@@ -2,7 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
-	. "github.com/zettio/weave/common"
+	. "github.com/weaveworks/weave/common"
 	"io/ioutil"
 	"net/http"
 	"os/exec"

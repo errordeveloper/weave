@@ -2,8 +2,8 @@ package main
 
 import (
 	"flag"
-	. "github.com/zettio/weave/common"
-	"github.com/zettio/weave/proxy"
+	. "github.com/weaveworks/weave/common"
+	"github.com/weaveworks/weave/proxy"
 	"net/http"
 )
 
